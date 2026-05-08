@@ -118,8 +118,6 @@ function CategoryRow({
   expanded: boolean
   onToggle: () => void
 }) {
-  const hasItems = cat.items.some(i => i.monthly > 0 || i.note)
-
   return (
     <div className="border-x border-b border-gray-200">
       {/* Category header */}
