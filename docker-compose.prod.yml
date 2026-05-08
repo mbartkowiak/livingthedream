@@ -1,0 +1,23 @@
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile.prod
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    volumes:
+      - zillow_data:/app/data
+    environment:
+      - DATABASE_PATH=/app/data/zillow.db
+    restart: unless-stopped
+
+volumes:
+  zillow_data:
