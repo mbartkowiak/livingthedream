@@ -8,10 +8,29 @@
  *  - Edmunds 2023 average auto loan payment
  *  - KFF Employer Health Benefits Survey 2023
  *  - AAA Your Driving Costs 2023
+ *  - Tax Foundation effective property tax rates (~2022)
+ *  - BEA Regional Price Parities 2022 (regional cost scaling)
  *  - Zillow ZHVI / ZORI (housing — passed in as props)
  */
 
-import { calcTaxes } from './taxCalc'
+import { calcTaxes, FilingStatus } from './taxCalc'
+import { propertyTaxRate, rppMultiplier } from './stateData'
+
+export type HousingMode = 'rent' | 'buy'
+export type HouseholdPreset = 'single' | 'couple' | 'family'
+
+export const HOUSEHOLD_LABELS: Record<HouseholdPreset, string> = {
+  single: 'Single adult',
+  couple: 'Couple',
+  family: 'Family (2 adults + child)',
+}
+
+/** Overrides are keyed by `itemKey(categoryId, itemName)` → monthly $ */
+export type BudgetOverrides = Record<string, number>
+
+export function itemKey(categoryId: string, itemName: string): string {
+  return `${categoryId}:${itemName}`
+}
 
 export interface LineItem {
   name:    string
@@ -33,12 +52,31 @@ export interface BudgetResult {
   takeHomeMonthly: number
   taxes:           BudgetCategory
   categories:      BudgetCategory[]
-  totalExpenses:   number   // taxes + all other categories
   surplus:         number   // takeHome - (all non-tax expenses); negative = deficit
-  surplusAfterTax: number   // takeHome - non-tax expenses
+  rppMultiplier:   number   // regional price multiplier applied to variable categories
 }
 
-function calcMonthlyMortgage(
+export interface BudgetInputs {
+  annualIncome:    number
+  state:           string
+  medianHomePrice: number
+  avgRent:         number | null
+  mortgageRate:    number   // e.g. 7.0
+  downPaymentPct:  number   // e.g. 20
+  housingMode:     HousingMode
+  filingStatus?:   FilingStatus     // default 'single'
+  household?:      HouseholdPreset  // default 'single'
+  overrides?:      BudgetOverrides
+}
+
+// Housing cost constants shared with the affordability finder — keep in sync
+export const HOME_INSURANCE_ANNUAL   = 1_400  // $/yr national avg (III 2023)
+export const MAINTENANCE_RATE        = 0.01   // 1% of home value per year
+export const FURNITURE_MONTHLY_BUY   = 150
+export const FURNITURE_MONTHLY_RENT  = 100
+export const RENTERS_INSURANCE_MONTHLY = 18
+
+export function calcMonthlyMortgage(
   homePrice: number,
   annualRatePct: number,
   downPaymentPct: number,
@@ -46,24 +84,59 @@ function calcMonthlyMortgage(
   const loan   = homePrice * (1 - downPaymentPct / 100)
   const r      = annualRatePct / 100 / 12
   const n      = 360
+  if (r === 0) return loan / n
   const factor = Math.pow(1 + r, n)
   return loan * (r * factor) / (factor - 1)
 }
 
+// ── Household preset adjustments ────────────────────────────────────────────
+// Category-level multipliers scale every item in the category; item-level
+// values then replace specific line items (applied after multipliers).
+
+const PRESET_CATEGORY_MULT: Record<HouseholdPreset, Record<string, number>> = {
+  single: {},
+  couple: {
+    food: 1.8, healthcare: 1.9, personalCare: 1.8, clothing: 1.8,
+    entertainment: 1.6, travel: 1.8, gifts: 1.5,
+  },
+  family: {
+    food: 2.4, healthcare: 2.6, personalCare: 2.0, clothing: 2.4,
+    entertainment: 1.8, travel: 2.0, gifts: 1.7,
+  },
+}
+
+const PRESET_ITEM_SET: Record<HouseholdPreset, Record<string, number>> = {
+  single: {},
+  couple: {
+    'utilities:Mobile phone': 140,   // shared plan, 2 lines
+  },
+  family: {
+    'utilities:Mobile phone': 140,
+    'childcare:Daycare / childcare': 1_300,  // Care.com 2023 nat. avg
+    "childcare:Kids' activities": 100,
+    // KFF 2023: employee share of family coverage premium
+    'healthcare:Health insurance premium (employee share)': 525,
+  },
+}
+
+// Categories whose national-average items get scaled by regional price levels
+const RPP_CATEGORIES = new Set([
+  'utilities', 'food', 'healthcare', 'personalCare', 'clothing', 'entertainment',
+])
+
 // ── main export ───────────────────────────────────────────────────────────
 
-export function calcBudget(
-  annualIncome:    number,
-  state:           string,
-  medianHomePrice: number,
-  avgRent:         number | null,
-  mortgageRate:    number,   // e.g. 7.0
-  downPaymentPct:  number,   // e.g. 20
-  housingMode:     'rent' | 'buy',
-): BudgetResult {
+export function calcBudget(inputs: BudgetInputs): BudgetResult {
+  const {
+    annualIncome, state, medianHomePrice, avgRent,
+    mortgageRate, downPaymentPct, housingMode,
+    filingStatus = 'single',
+    household = 'single',
+    overrides = {},
+  } = inputs
 
   const grossMonthly = annualIncome / 12
-  const taxData      = calcTaxes(annualIncome, state)
+  const taxData      = calcTaxes(annualIncome, state, filingStatus)
   const takeHomeMonthly = (annualIncome - taxData.total) / 12
 
   // ── TAXES ──────────────────────────────────────────────────────────────
@@ -72,7 +145,7 @@ export function calcBudget(
     name:  'Taxes',
     color: 'bg-slate-700',
     items: [
-      { name: 'Federal income tax',       monthly: taxData.federal        / 12, source: 'IRS 2024 brackets' },
+      { name: 'Federal income tax',       monthly: taxData.federal        / 12, source: `IRS 2024 brackets (${filingStatus === 'married' ? 'married filing jointly' : 'single'})` },
       { name: 'State income tax',         monthly: taxData.state          / 12, source: 'State rate estimate' },
       { name: 'Social Security (FICA)',   monthly: taxData.socialSecurity / 12, source: 'SSA 2024 (6.2%)' },
       { name: 'Medicare (FICA)',          monthly: taxData.medicare       / 12, source: 'IRS 2024 (1.45%)' },
@@ -81,25 +154,26 @@ export function calcBudget(
   }
 
   // ── HOUSING ────────────────────────────────────────────────────────────
+  const propTaxRate  = propertyTaxRate(state)
   const mortgage     = calcMonthlyMortgage(medianHomePrice, mortgageRate, downPaymentPct)
-  const propTax      = (medianHomePrice * 0.011) / 12   // 1.1% national avg
-  const hoInsurance  = 1_400 / 12                        // $1,400/yr national avg (Insurance Information Institute)
-  const maintenance  = (medianHomePrice * 0.01) / 12    // 1% rule
+  const propTax      = (medianHomePrice * propTaxRate) / 12
+  const hoInsurance  = HOME_INSURANCE_ANNUAL / 12
+  const maintenance  = (medianHomePrice * MAINTENANCE_RATE) / 12
   const rentAmt      = avgRent ?? grossMonthly * 0.30   // fallback to 30% rule
 
   const housingItems: LineItem[] = housingMode === 'buy'
     ? [
         { name: 'Mortgage payment',         monthly: mortgage,    source: `${mortgageRate}% rate, ${downPaymentPct}% down, 30 yr` },
-        { name: 'Property taxes',           monthly: propTax,     source: 'Nat. avg 1.1% of value (Tax Foundation)' },
+        { name: 'Property taxes',           monthly: propTax,     source: `${(propTaxRate * 100).toFixed(2)}% effective rate, ${state.toUpperCase()} (Tax Foundation)` },
         { name: "Homeowner's insurance",    monthly: hoInsurance, source: 'Nat. avg $1,400/yr (III 2023)' },
         { name: 'Repairs & maintenance',    monthly: maintenance, source: '1% of home value rule of thumb' },
         { name: 'HOA fees',                 monthly: 0,           source: 'Assumed $0 — varies widely', note: 'Add if applicable' },
-        { name: 'Furniture / improvement',  monthly: 150,         source: 'BLS CEX 2022 estimate' },
+        { name: 'Furniture / improvement',  monthly: FURNITURE_MONTHLY_BUY, source: 'BLS CEX 2022 estimate' },
       ]
     : [
         { name: 'Rent',                     monthly: rentAmt,     source: avgRent ? 'Zillow ZORI' : '30% of gross (est.)' },
-        { name: "Renter's insurance",       monthly: 18,          source: 'Nat. avg ~$220/yr (NerdWallet 2023)' },
-        { name: 'Furniture / improvement',  monthly: 100,         source: 'BLS CEX 2022 estimate' },
+        { name: "Renter's insurance",       monthly: RENTERS_INSURANCE_MONTHLY, source: 'Nat. avg ~$220/yr (NerdWallet 2023)' },
+        { name: 'Furniture / improvement',  monthly: FURNITURE_MONTHLY_RENT, source: 'BLS CEX 2022 estimate' },
       ]
 
   // ── UTILITIES ──────────────────────────────────────────────────────────
@@ -233,23 +307,37 @@ export function calcBudget(
   ]
 
   // ── ANNUAL / IRREGULAR (SINKING FUNDS) ────────────────────────────────
+  // Note: only truly irregular expenses belong here. Car registration, medical
+  // out-of-pocket, holiday gifts, and home repairs are already counted in the
+  // Transportation, Healthcare, Gifts, and Housing categories.
   const sinkingItems: LineItem[] = [
-    { name: 'Car registration / fees', monthly: 16, source: 'DMV national avg ($195/yr ÷ 12)' },
     { name: 'Warehouse membership (Costco, etc.)', monthly: 10, source: '$120/yr ÷ 12' },
     { name: 'Amazon Prime / annual subs', monthly: 12, source: '$139/yr ÷ 12' },
-    { name: 'Holiday gifts reserve',  monthly: 50,  source: 'NRF avg spend / 12' },
-    { name: 'Medical out-of-pocket reserve', monthly: 75, source: 'IRS 2024 OOP max $9,450 ÷ 12 (partial reserve)' },
     { name: 'Future car replacement fund', monthly: 100, source: '~$6,000 saved over 5 yrs for used car' },
-    { name: 'Home repair reserve',   monthly: housingMode === 'buy' ? Math.round((medianHomePrice * 0.01) / 12) : 0, source: '1% of home value/yr (if buying)' },
   ]
 
   // ── BUILD CATEGORY OBJECTS ─────────────────────────────────────────────
+  const rpp = rppMultiplier(state)
+  const catMult = PRESET_CATEGORY_MULT[household]
+  const itemSet = PRESET_ITEM_SET[household]
+
   const buildCat = (
-    id: string, name: string, color: string, items: LineItem[]
-  ): BudgetCategory => ({
-    id, name, color, items,
-    total: items.reduce((s, i) => s + i.monthly, 0),
-  })
+    id: string, name: string, color: string, rawItems: LineItem[]
+  ): BudgetCategory => {
+    const items = rawItems.map(item => {
+      const key = itemKey(id, item.name)
+      let monthly = item.monthly
+      // 1. household preset: category multiplier, then explicit item values
+      monthly *= catMult[id] ?? 1
+      if (key in itemSet) monthly = itemSet[key]
+      // 2. regional price adjustment for national-average categories
+      if (RPP_CATEGORIES.has(id)) monthly *= rpp
+      // 3. user overrides always win
+      if (key in overrides) monthly = overrides[key]
+      return { ...item, monthly }
+    })
+    return { id, name, color, items, total: items.reduce((s, i) => s + i.monthly, 0) }
+  }
 
   const categories: BudgetCategory[] = [
     buildCat('housing',       'Housing',                         'bg-blue-700',   housingItems),
@@ -274,7 +362,6 @@ export function calcBudget(
   ]
 
   const nonTaxExpenses = categories.reduce((s, c) => s + c.total, 0)
-  const totalExpenses  = taxCategory.total + nonTaxExpenses
   const surplus        = takeHomeMonthly - nonTaxExpenses
 
   return {
@@ -282,8 +369,7 @@ export function calcBudget(
     takeHomeMonthly,
     taxes: taxCategory,
     categories,
-    totalExpenses,
     surplus,
-    surplusAfterTax: surplus,
+    rppMultiplier: rpp,
   }
 }

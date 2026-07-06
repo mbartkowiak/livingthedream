@@ -4,20 +4,40 @@
  * Update annually.
  */
 
-// 2024 federal income tax brackets — single filer
-const FEDERAL_BRACKETS = [
-  { max: 11_600,  rate: 0.10 },
-  { max: 47_150,  rate: 0.12 },
-  { max: 100_525, rate: 0.22 },
-  { max: 191_950, rate: 0.24 },
-  { max: 243_725, rate: 0.32 },
-  { max: 609_350, rate: 0.35 },
-  { max: Infinity, rate: 0.37 },
-]
-const STANDARD_DEDUCTION = 14_600   // 2024 single
-const SS_RATE            = 0.062
-const SS_WAGE_BASE       = 168_600  // 2024
-const MEDICARE_RATE      = 0.0145
+export type FilingStatus = 'single' | 'married'
+
+interface Bracket { max: number; rate: number }
+
+// 2024 federal income tax brackets
+const FEDERAL_BRACKETS: Record<FilingStatus, Bracket[]> = {
+  single: [
+    { max: 11_600,  rate: 0.10 },
+    { max: 47_150,  rate: 0.12 },
+    { max: 100_525, rate: 0.22 },
+    { max: 191_950, rate: 0.24 },
+    { max: 243_725, rate: 0.32 },
+    { max: 609_350, rate: 0.35 },
+    { max: Infinity, rate: 0.37 },
+  ],
+  married: [
+    { max: 23_200,  rate: 0.10 },
+    { max: 94_300,  rate: 0.12 },
+    { max: 201_050, rate: 0.22 },
+    { max: 383_900, rate: 0.24 },
+    { max: 487_450, rate: 0.32 },
+    { max: 731_200, rate: 0.35 },
+    { max: Infinity, rate: 0.37 },
+  ],
+}
+
+const STANDARD_DEDUCTION: Record<FilingStatus, number> = {
+  single: 14_600,   // 2024
+  married: 29_200,  // 2024 MFJ
+}
+
+const SS_RATE       = 0.062
+const SS_WAGE_BASE  = 168_600  // 2024, per earner
+const MEDICARE_RATE = 0.0145
 
 // Approximate effective state income tax rates for a middle-income single filer.
 // No-tax states = 0. Progressive states use a typical effective rate.
@@ -45,12 +65,16 @@ export interface TaxBreakdown {
   effectiveRate: number
 }
 
-export function calcTaxes(grossAnnual: number, state: string): TaxBreakdown {
+export function calcTaxes(
+  grossAnnual: number,
+  state: string,
+  filingStatus: FilingStatus = 'single',
+): TaxBreakdown {
   // Federal income tax
-  const taxable = Math.max(0, grossAnnual - STANDARD_DEDUCTION)
+  const taxable = Math.max(0, grossAnnual - STANDARD_DEDUCTION[filingStatus])
   let federal = 0
   let prev = 0
-  for (const bracket of FEDERAL_BRACKETS) {
+  for (const bracket of FEDERAL_BRACKETS[filingStatus]) {
     if (taxable <= prev) break
     federal += (Math.min(taxable, bracket.max) - prev) * bracket.rate
     prev = bracket.max
@@ -60,8 +84,11 @@ export function calcTaxes(grossAnnual: number, state: string): TaxBreakdown {
   const stateRate = STATE_TAX_RATES[state.toUpperCase()] ?? 0.05
   const stateTax = grossAnnual * stateRate
 
-  // FICA
-  const ss       = Math.min(grossAnnual, SS_WAGE_BASE) * SS_RATE
+  // FICA — married assumes two earners splitting income evenly,
+  // so the SS wage base applies per earner
+  const ss = filingStatus === 'married'
+    ? 2 * Math.min(grossAnnual / 2, SS_WAGE_BASE) * SS_RATE
+    : Math.min(grossAnnual, SS_WAGE_BASE) * SS_RATE
   const medicare = grossAnnual * MEDICARE_RATE
 
   const total = federal + stateTax + ss + medicare
@@ -71,11 +98,15 @@ export function calcTaxes(grossAnnual: number, state: string): TaxBreakdown {
     socialSecurity:  Math.round(ss),
     medicare:        Math.round(medicare),
     total:           Math.round(total),
-    effectiveRate:   total / grossAnnual,
+    effectiveRate:   grossAnnual > 0 ? total / grossAnnual : 0,
   }
 }
 
-export function monthlyTakeHome(grossAnnual: number, state: string): number {
-  const taxes = calcTaxes(grossAnnual, state)
+export function monthlyTakeHome(
+  grossAnnual: number,
+  state: string,
+  filingStatus: FilingStatus = 'single',
+): number {
+  const taxes = calcTaxes(grossAnnual, state, filingStatus)
   return (grossAnnual - taxes.total) / 12
 }

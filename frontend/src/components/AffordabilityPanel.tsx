@@ -1,5 +1,11 @@
 import { useState, useMemo } from 'react'
-import { calcBudget } from '../utils/budgetCalc'
+import { BudgetInputs, HouseholdPreset, HOUSEHOLD_LABELS, HousingMode } from '../utils/budgetCalc'
+import { FilingStatus } from '../utils/taxCalc'
+import { budgetAffordability } from '../utils/affordability'
+import { formatCurrency as fmt, formatPct } from '../utils/format'
+import { NATIONAL_MEDIAN_SALARY, NATIONAL_MEDIAN_YEAR } from '../utils/constants'
+import { useMortgageRate } from '../hooks/useMortgageRate'
+import { useBudgetPrefs } from '../hooks/useBudgetPrefs'
 
 interface Props {
   medianHomePrice: number
@@ -9,82 +15,19 @@ interface Props {
   state:           string          // e.g. "CA" — needed for state income tax
 }
 
-// ── National median salary ─────────────────────────────────────────────────
-// Source: BLS Current Population Survey, 2023 Annual
-// Update annually: https://www.bls.gov/cps/cpsaat37.htm
-const NATIONAL_MEDIAN_SALARY = 59_228
-const NATIONAL_MEDIAN_YEAR   = '2023'
-
-function fmt(n: number): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency', currency: 'USD', maximumFractionDigits: 0,
-  }).format(n)
-}
-
-function formatPct(n: number, decimals = 1): string {
-  return `${n >= 0 ? '+' : ''}${n.toFixed(decimals)}%`
-}
-
-/** Pull the housing category total and compute leftover for housing */
-function budgetAffordability(
-  annualIncome:    number,
-  state:           string,
-  medianHomePrice: number,
-  avgRent:         number | null,
-  rate:            number,
-  down:            number,
-  housingMode:     'rent' | 'buy',
-) {
-  const budget = calcBudget(
-    annualIncome, state, medianHomePrice, avgRent, rate, down, housingMode,
-  )
-  const housingCost    = budget.categories.find(c => c.id === 'housing')?.total ?? 0
-  const nonHousing     = budget.categories
-    .filter(c => c.id !== 'housing')
-    .reduce((s, c) => s + c.total, 0)
-  const availableForHousing = budget.takeHomeMonthly - nonHousing
-  const canAfford      = availableForHousing >= housingCost
-  const gap            = Math.abs(availableForHousing - housingCost)
-  // Salary that would make availableForHousing === housingCost (binary search)
-  let salaryNeeded = annualIncome
-  if (!canAfford) {
-    let lo = annualIncome, hi = annualIncome * 10
-    for (let i = 0; i < 40; i++) {
-      const mid = (lo + hi) / 2
-      const b2  = calcBudget(mid, state, medianHomePrice, avgRent, rate, down, housingMode)
-      const nh2 = b2.categories.filter(c => c.id !== 'housing').reduce((s, c) => s + c.total, 0)
-      const avail2 = b2.takeHomeMonthly - nh2
-      const hc2    = b2.categories.find(c => c.id === 'housing')?.total ?? 0
-      if (avail2 >= hc2) hi = mid; else lo = mid
-    }
-    salaryNeeded = Math.ceil((lo + hi) / 2)
-  }
-  return {
-    budget, housingCost, nonHousing,
-    availableForHousing, canAfford, gap,
-    grossMonthly: budget.grossMonthly,
-    takeHome:     budget.takeHomeMonthly,
-    taxMonthly:   budget.taxes.total,
-    salaryNeeded,
-  }
-}
-
 // ── Snapshot banner (area / national) ─────────────────────────────────────
 function ContextBanner({
-  label, income, incomeLabel,
-  medianHomePrice, avgRent, state, rate, down, housingMode,
-  colorAfford, colorNot,
+  label, incomeLabel, inputs, colorAfford, colorNot,
 }: {
-  label: string; income: number; incomeLabel: string
-  medianHomePrice: number; avgRent: number | null; state: string
-  rate: number; down: number; housingMode: 'rent' | 'buy'
-  colorAfford: string; colorNot: string
+  label: string
+  incomeLabel: string
+  inputs: BudgetInputs
+  colorAfford: string
+  colorNot: string
 }) {
-  const aff = useMemo(
-    () => budgetAffordability(income, state, medianHomePrice, avgRent, rate, down, housingMode),
-    [income, state, medianHomePrice, avgRent, rate, down, housingMode],
-  )
+  const aff = useMemo(() => budgetAffordability(inputs), [inputs])
   const color = aff.canAfford ? colorAfford : colorNot
+  const housingMode = inputs.housingMode
   return (
     <div className={`rounded-lg px-5 py-4 border ${color}`}>
       <p className="text-xs font-semibold uppercase tracking-wide mb-1 opacity-70">{label}</p>
@@ -113,24 +56,35 @@ export default function AffordabilityPanel({
   medianHomePrice, areaAvgIncome, incomeYear, avgRent, state,
 }: Props) {
   const [salary,      setSalary]      = useState('')
-  const [rate,        setRate]        = useState('7.0')
+  const [rate,        setRate]        = useState('')
   const [downPayment, setDownPayment] = useState('20')
-  const [housingMode, setHousingMode] = useState<'rent' | 'buy'>('buy')
+  const [housingMode, setHousingMode] = useState<HousingMode>('buy')
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const liveRate = useMortgageRate()
+  const { prefs, update } = useBudgetPrefs()
 
-  const r = parseFloat(rate)
+  const parsedRate = parseFloat(rate)
+  const r = parsedRate > 0 && parsedRate <= 20 ? parsedRate : liveRate.rate
   const d = parseFloat(downPayment)
+  const validParams = r > 0 && !isNaN(d) && d >= 0 && d < 100
+
+  const baseInputs = useMemo(() => ({
+    state,
+    medianHomePrice,
+    avgRent,
+    mortgageRate: r,
+    downPaymentPct: validParams ? d : 20,
+    housingMode,
+    filingStatus: prefs.filingStatus,
+    household: prefs.household,
+    overrides: prefs.overrides,
+  }), [state, medianHomePrice, avgRent, r, d, validParams, housingMode, prefs])
 
   const userAff = useMemo(() => {
     const s = parseFloat(salary.replace(/,/g, ''))
-    if (!s || s <= 0 || !r || r <= 0 || isNaN(d) || d < 0 || d >= 100) return null
-    return {
-      s,
-      ...budgetAffordability(s, state, medianHomePrice, avgRent, r, d, housingMode),
-    }
-  }, [salary, state, medianHomePrice, avgRent, r, d, housingMode])
-
-  const validParams = r > 0 && !isNaN(d) && d >= 0 && d < 100
+    if (!s || s <= 0 || !validParams) return null
+    return { s, ...budgetAffordability({ ...baseInputs, annualIncome: s }) }
+  }, [salary, baseInputs, validParams])
 
   return (
     <div className="bg-white rounded-xl shadow-md border border-gray-100 overflow-hidden">
@@ -144,19 +98,44 @@ export default function AffordabilityPanel({
 
       <div className="px-6 py-5 space-y-5">
 
-        {/* Housing mode toggle */}
-        <div>
-          <p className="text-xs font-medium text-gray-600 mb-1.5">Housing scenario</p>
-          <div className="flex rounded-lg border border-gray-300 overflow-hidden w-fit">
-            {(['buy', 'rent'] as const).map(mode => (
-              <button key={mode}
-                onClick={() => setHousingMode(mode)}
-                className={`px-5 py-1.5 text-sm font-medium transition-colors
-                  ${housingMode === mode ? 'bg-blue-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'}`}
-              >
-                {mode === 'buy' ? 'Buying' : 'Renting'}
-              </button>
-            ))}
+        {/* Scenario controls */}
+        <div className="flex flex-wrap gap-4">
+          <div>
+            <p className="text-xs font-medium text-gray-600 mb-1.5">Housing scenario</p>
+            <div className="flex rounded-lg border border-gray-300 overflow-hidden w-fit">
+              {(['buy', 'rent'] as const).map(mode => (
+                <button key={mode}
+                  onClick={() => setHousingMode(mode)}
+                  className={`px-5 py-1.5 text-sm font-medium transition-colors
+                    ${housingMode === mode ? 'bg-blue-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'}`}
+                >
+                  {mode === 'buy' ? 'Buying' : 'Renting'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1.5">Household</label>
+            <select
+              value={prefs.household}
+              onChange={e => update({ household: e.target.value as HouseholdPreset })}
+              className="px-2 py-1.5 text-sm border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {(Object.keys(HOUSEHOLD_LABELS) as HouseholdPreset[]).map(h => (
+                <option key={h} value={h}>{HOUSEHOLD_LABELS[h]}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1.5">Tax filing</label>
+            <select
+              value={prefs.filingStatus}
+              onChange={e => update({ filingStatus: e.target.value as FilingStatus })}
+              className="px-2 py-1.5 text-sm border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="single">Single</option>
+              <option value="married">Married</option>
+            </select>
           </div>
         </div>
 
@@ -164,12 +143,8 @@ export default function AffordabilityPanel({
         {areaAvgIncome && validParams && (
           <ContextBanner
             label={`Area Avg. Income Snapshot · IRS ${incomeYear}`}
-            income={areaAvgIncome}
             incomeLabel={`${fmt(areaAvgIncome)}/yr area avg.`}
-            medianHomePrice={medianHomePrice}
-            avgRent={avgRent}
-            state={state}
-            rate={r} down={d} housingMode={housingMode}
+            inputs={{ ...baseInputs, annualIncome: areaAvgIncome }}
             colorAfford="bg-green-50 border-green-200 text-green-800"
             colorNot="bg-amber-50 border-amber-200 text-amber-800"
           />
@@ -179,12 +154,8 @@ export default function AffordabilityPanel({
         {validParams && (
           <ContextBanner
             label={`National Median Earner · BLS ${NATIONAL_MEDIAN_YEAR}`}
-            income={NATIONAL_MEDIAN_SALARY}
             incomeLabel={`${fmt(NATIONAL_MEDIAN_SALARY)}/yr national median`}
-            medianHomePrice={medianHomePrice}
-            avgRent={avgRent}
-            state={state}
-            rate={r} down={d} housingMode={housingMode}
+            inputs={{ ...baseInputs, annualIncome: NATIONAL_MEDIAN_SALARY }}
             colorAfford="bg-green-50 border-green-200 text-green-800"
             colorNot="bg-rose-50 border-rose-200 text-rose-800"
           />
@@ -193,7 +164,7 @@ export default function AffordabilityPanel({
         {/* Salary input */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Your Annual Gross Salary
+            Your {prefs.filingStatus === 'married' ? 'Household' : ''} Annual Gross Salary
           </label>
           <div className="relative">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 font-medium">$</span>
@@ -217,8 +188,16 @@ export default function AffordabilityPanel({
         {showAdvanced && (
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Interest Rate (%)</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Interest Rate (%)
+                {liveRate.asOf && (
+                  <span className="ml-1 font-normal text-xs text-gray-400">
+                    live: {liveRate.rate.toFixed(2)}% (FRED)
+                  </span>
+                )}
+              </label>
               <input type="number" step="0.1" min="1" max="20" value={rate}
+                placeholder={liveRate.rate.toFixed(2)}
                 onChange={e => setRate(e.target.value)}
                 className="w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
@@ -271,7 +250,7 @@ export default function AffordabilityPanel({
                 <Row
                   label={housingMode === 'buy' ? 'Mortgage + taxes + insurance + maintenance' : 'Avg. rent (Zillow ZORI)'}
                   value={fmt(userAff.housingCost)}
-                  sub={housingMode === 'buy' ? `${downPayment}% down · ${rate}% rate · 30 yr · 1.1% prop tax · 1% maintenance` : 'Zillow ZORI data'}
+                  sub={housingMode === 'buy' ? `${baseInputs.downPaymentPct}% down · ${r.toFixed(2)}% rate · 30 yr · ${state.toUpperCase()} prop tax · 1% maintenance` : 'Zillow ZORI data'}
                   highlight={!userAff.canAfford}
                 />
                 <Row
@@ -318,17 +297,17 @@ export default function AffordabilityPanel({
                   </p>
                 </div>
                 {(() => {
-                  const rentAff = budgetAffordability(userAff.s, state, medianHomePrice, avgRent, r, d, 'rent')
-                  const buyAff  = budgetAffordability(userAff.s, state, medianHomePrice, avgRent, r, d, 'buy')
+                  const rentAff = budgetAffordability({ ...baseInputs, annualIncome: userAff.s, housingMode: 'rent' })
+                  const buyAff  = budgetAffordability({ ...baseInputs, annualIncome: userAff.s, housingMode: 'buy' })
                   const diff    = buyAff.housingCost - rentAff.housingCost
                   return (
                     <div className="divide-y divide-gray-100 text-sm px-4">
                       <Row label="Avg. monthly rent"               value={fmt(rentAff.housingCost)} sub="Zillow ZORI" />
-                      <Row label="Monthly mortgage + costs (buy)"  value={fmt(buyAff.housingCost)}  sub={`${downPayment}% down · ${rate}% · prop tax · insurance · maintenance`} />
+                      <Row label="Monthly mortgage + costs (buy)"  value={fmt(buyAff.housingCost)}  sub={`${baseInputs.downPaymentPct}% down · ${r.toFixed(2)}% · prop tax · insurance · maintenance`} />
                       <Row
                         label={diff > 0 ? 'Renting saves per month' : 'Buying saves per month'}
                         value={fmt(Math.abs(diff))}
-                        sub="Payment comparison only — buying builds equity over time"
+                        sub="Payment comparison only — see the break-even card below for equity"
                         highlight={diff > 0}
                       />
                     </div>

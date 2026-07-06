@@ -9,4 +9,6 @@ export interface HomePriceResult {
   avg_rent: number | null     // Zillow ZORI avg monthly rent
   avg_agi: number | null      // IRS SOI average AGI per tax return
   income_year: string | null  // Tax year the IRS data is from
+  latitude: number | null     // Census ZCTA centroid (null on pre-reseed dbs)
+  longitude: number | null
 }

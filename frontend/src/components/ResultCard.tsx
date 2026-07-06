@@ -1,15 +1,8 @@
 import { HomePriceResult } from '../types'
+import { formatCurrency } from '../utils/format'
 
 interface Props {
   result: HomePriceResult
-}
-
-function formatCurrency(value: number): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(value)
 }
 
 function formatDate(dateStr: string): string {

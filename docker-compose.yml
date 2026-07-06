@@ -17,6 +17,9 @@ services:
     volumes:
       - ./frontend:/app
       - /app/node_modules
+    environment:
+      # Browser connects to the HMR WebSocket through Nginx on port 80
+      - VITE_HMR_CLIENT_PORT=80
     restart: unless-stopped
 
   backend:
